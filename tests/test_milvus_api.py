@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
+from app.config.settings import Settings
 from app.dependencies import get_embedding_service, get_milvus_service
 from app.main import app
+from app.services.milvus_service import MilvusService
+from tests.test_milvus_service import FakeMilvusClient
 
 
 class FakeEmbeddingService:
@@ -83,5 +86,49 @@ def test_milvus_sdk_routes():
     assert hybrid_resp.status_code == 200
 
     assert client.post("/milvus/delete", json={"ids": [1]}).status_code == 200
+
+    app.dependency_overrides.clear()
+
+
+def test_upsert_returns_400_when_embedding_dim_mismatch():
+    service = MilvusService(Settings(milvus_vector_dim=2048))
+    service._client = FakeMilvusClient()  # noqa: SLF001
+    service._loaded = True
+    app.dependency_overrides[get_milvus_service] = lambda: service
+    client = TestClient(app)
+
+    response = client.post(
+        "/milvus/upsert",
+        json={
+            "data": [
+                {
+                    "primary_key": 35344,
+                    "embedding": [-0.016357421875],
+                    "dimension": 1024,
+                }
+            ]
+        },
+    )
+
+    assert response.status_code == 400
+    assert "embedding length must be 2048, got 1" in response.json()["detail"]
+
+    app.dependency_overrides.clear()
+
+
+def test_upsert_returns_200_with_json_serializable_result():
+    service = MilvusService(Settings(milvus_vector_dim=2))
+    service._client = FakeMilvusClient()  # noqa: SLF001
+    service._loaded = True
+    app.dependency_overrides[get_milvus_service] = lambda: service
+    client = TestClient(app)
+
+    response = client.post(
+        "/milvus/upsert",
+        json={"data": [{"primary_key": 1, "embedding": [0.1, 0.2]}]},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"result": {"upsert_count": 1, "ids": [1]}}
 
     app.dependency_overrides.clear()

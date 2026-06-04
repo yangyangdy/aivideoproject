@@ -71,6 +71,23 @@ class MilvusService:
     def ping(self) -> bool:
         return self.connect().has_collection(collection_name=self.collection_name)
 
+    @staticmethod
+    def _sanitize_mutation_result(result: Any) -> Any:
+        """Convert pymilvus protobuf containers into JSON-serializable Python types."""
+        if isinstance(result, dict):
+            return {key: MilvusService._sanitize_mutation_result(value) for key, value in result.items()}
+        if isinstance(result, (str, bytes, int, float, bool)) or result is None:
+            return result
+        if isinstance(result, list):
+            return [MilvusService._sanitize_mutation_result(item) for item in result]
+        if isinstance(result, tuple):
+            return [MilvusService._sanitize_mutation_result(item) for item in result]
+        try:
+            iterator = iter(result)
+        except TypeError:
+            return result
+        return [MilvusService._sanitize_mutation_result(item) for item in iterator]
+
     def get(self, ids: list[int], output_fields: list[str] | None = None) -> list[dict[str, Any]]:
         self.ensure_collection()
         return self.connect().get(
@@ -79,9 +96,32 @@ class MilvusService:
             output_fields=output_fields,
         )
 
+    def _validate_write_data(self, data: list[dict[str, Any]]) -> None:
+        expected_dim = self.settings.milvus_vector_dim
+        for index, item in enumerate(data):
+            if item.get("primary_key") is None:
+                raise ValueError(f"data[{index}]: primary_key is required")
+            embedding = item.get("embedding")
+            if not isinstance(embedding, list):
+                raise ValueError(f"data[{index}]: embedding must be a list of floats")
+            actual_dim = len(embedding)
+            if actual_dim != expected_dim:
+                meta_dim = item.get("dimension")
+                hint = ""
+                if meta_dim is not None and int(meta_dim) != actual_dim:
+                    hint = (
+                        f"; request field 'dimension'={meta_dim} does not match "
+                        f"embedding length ({actual_dim}) — Milvus only uses the embedding array"
+                    )
+                raise ValueError(
+                    f"data[{index}]: embedding length must be {expected_dim}, got {actual_dim}{hint}"
+                )
+
     def insert(self, data: list[dict[str, Any]]) -> dict[str, Any]:
         self.ensure_collection()
-        return self.connect().insert(collection_name=self.collection_name, data=data)
+        self._validate_write_data(data)
+        result = self.connect().insert(collection_name=self.collection_name, data=data)
+        return self._sanitize_mutation_result(result)
 
     def query(
         self,
@@ -119,7 +159,9 @@ class MilvusService:
 
     def upsert(self, data: list[dict[str, Any]]) -> dict[str, Any]:
         self.ensure_collection()
-        return self.connect().upsert(collection_name=self.collection_name, data=data)
+        self._validate_write_data(data)
+        result = self.connect().upsert(collection_name=self.collection_name, data=data)
+        return self._sanitize_mutation_result(result)
 
     def hybrid_search(
         self,
@@ -148,7 +190,8 @@ class MilvusService:
             kwargs["ids"] = ids
         if filter is not None:
             kwargs["filter"] = filter
-        return self.connect().delete(**kwargs)
+        result = self.connect().delete(**kwargs)
+        return self._sanitize_mutation_result(result)
 
     # ---- helpers used by sync script ----
 

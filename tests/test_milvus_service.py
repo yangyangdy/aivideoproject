@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from app.config.settings import Settings
 from app.services.milvus_service import MilvusService, VectorEntity
 
@@ -40,7 +42,7 @@ class FakeMilvusClient:
 
     def upsert(self, collection_name: str, data):
         self.last_upsert = data
-        return {"upsert_count": len(data)}
+        return {"upsert_count": len(data), "ids": (item["primary_key"] for item in data)}
 
     def hybrid_search(self, collection_name: str, reqs, ranker, limit=10, output_fields=None):
         self.last_hybrid = {"reqs": reqs, "limit": limit}
@@ -84,3 +86,32 @@ def test_wrapper_search():
     result = service.search(data=[[0.1, 0.2]], limit=5, filter="tenant_id == 1")
     assert result[0][0]["id"] == 1
     assert fake.last_search["limit"] == 5
+
+
+def test_upsert_rejects_wrong_embedding_dim():
+    service = MilvusService(Settings(milvus_vector_dim=2048))
+    fake = FakeMilvusClient()
+    service._client = fake  # noqa: SLF001
+    service._loaded = True
+
+    with pytest.raises(ValueError, match="embedding length must be 2048, got 1"):
+        service.upsert(
+            [
+                {
+                    "primary_key": 35344,
+                    "embedding": [-0.016357421875],
+                    "dimension": 1024,
+                }
+            ]
+        )
+    assert fake.last_upsert is None
+
+
+def test_sanitize_mutation_result_converts_iterables():
+    service = MilvusService(Settings(milvus_vector_dim=2))
+    fake = FakeMilvusClient()
+    service._client = fake  # noqa: SLF001
+    service._loaded = True
+
+    result = service.upsert([{"primary_key": 1, "embedding": [0.1, 0.2]}])
+    assert result == {"upsert_count": 1, "ids": [1]}
