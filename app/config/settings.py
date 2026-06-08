@@ -49,6 +49,13 @@ class Settings(BaseSettings):
     embedding_dimensions: int = 2048
     embedding_timeout_seconds: int = 60
 
+    log_dir: str = "logs"
+    log_file: str = "app.log"
+    log_level: str = "INFO"
+    log_console: bool = False
+    log_max_bytes: int = 10_485_760
+    log_backup_count: int = 5
+
     @field_validator("embedding_api_key", mode="before")
     @classmethod
     def normalize_embedding_api_key(cls, value: object) -> object:

@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 venv/
 state/
+logs/
 *.egg-info/
 .DS_Store
 .idea/

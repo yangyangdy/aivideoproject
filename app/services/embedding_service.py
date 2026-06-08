@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
 
 import httpx
 
 from app.config.settings import Settings
+
+logger = logging.getLogger(__name__)
 
 # 方舟真实 Key 为 sk- 后接较长随机串；sk-UUID 多为误用业务 ID 或错误拼接
 _SK_UUID_PATTERN = re.compile(
@@ -50,12 +53,29 @@ class EmbeddingService:
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
         }
+        safe_payload = {
+            "model": payload["model"],
+            "dimensions": payload["dimensions"],
+            "encoding_format": payload["encoding_format"],
+            "input_count": len(input_items),
+            "input_preview": input_items[:3],
+        }
+        logger.info(
+            "Embedding API request url=%s payload=%s",
+            self.settings.embedding_api_url,
+            safe_payload,
+        )
         with httpx.Client(timeout=self.settings.embedding_timeout_seconds) as client:
             response = client.post(self.settings.embedding_api_url, headers=headers, json=payload)
             try:
                 response.raise_for_status()
             except httpx.HTTPStatusError as exc:
                 body = exc.response.text[:800]
+                logger.error(
+                    "Embedding API HTTP error status=%s body=%s",
+                    exc.response.status_code,
+                    body,
+                )
                 hint = (
                     "请确认：1) EMBEDDING_API_KEY 来自火山方舟/LAS「API Key 管理」（通常为 sk- 开头）；"
                     "2) 已在控制台开通 doubao-embedding-vision 模型；"
@@ -66,7 +86,14 @@ class EmbeddingService:
                 raise ValueError(
                     f"Embedding API HTTP {exc.response.status_code}: {body}. {hint}"
                 ) from exc
-            return self._parse_embeddings(response.json())
+            body = response.json()
+            vectors = self._parse_embeddings(body)
+            logger.info(
+                "Embedding API response vector_count=%s dimension=%s",
+                len(vectors),
+                len(vectors[0]) if vectors else 0,
+            )
+            return vectors
 
     @staticmethod
     def _parse_embeddings(body: dict[str, Any]) -> list[list[float]]:
@@ -75,9 +102,18 @@ class EmbeddingService:
             return [[float(v) for v in data["embedding"]]]
         if isinstance(data, list):
             vectors: list[list[float]] = []
+            indexed: list[tuple[int, list[float]]] = []
             for item in data:
                 if isinstance(item, dict) and "embedding" in item:
-                    vectors.append([float(v) for v in item["embedding"]])
+                    vector = [float(v) for v in item["embedding"]]
+                    index = item.get("index")
+                    if isinstance(index, int):
+                        indexed.append((index, vector))
+                    else:
+                        vectors.append(vector)
+            if indexed:
+                indexed.sort(key=lambda pair: pair[0])
+                return [vector for _, vector in indexed]
             if vectors:
                 return vectors
         raise ValueError(f"unexpected embedding API response: {body}")
