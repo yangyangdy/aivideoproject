@@ -21,7 +21,13 @@ class AsrParser(Protocol):
 
 
 class Segmenter(Protocol):
-    def segment(self, words: list[WordToken], duration_ms: int) -> list[SegmentDraft]: ...
+    def segment(
+        self,
+        words: list[WordToken],
+        duration_ms: int,
+        *,
+        segment_count: int | None = None,
+    ) -> list[SegmentDraft]: ...
 
 
 class TextEmbedder(Protocol):

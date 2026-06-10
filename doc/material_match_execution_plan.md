@@ -75,13 +75,13 @@ PHP 侧只需传入 `uid` 与公网可访问的 `audio_url`，ASR 识别由 Pyth
 
 **带候选素材列表的请求示例：**
 
-去重后的候选数量必须 **≥** 音频切分后的片段数（`total_segments`），否则接口直接返回 400。
+去重后的候选数量决定片段数，音频时长均分，不再固定 3 秒切分。
 
 ```json
 {
   "uid": 13,
   "audio_url": "https://tulingai-1318672529.oss-cn-hangzhou.aliyuncs.com/uploads/voice/20260423/volcano_volcano_69e9d2575f2fb_3787_1776931442.mp3",
-  "candidate_material_ids": [4777, 4675, 5205, 5218, 4502, 4495, 3825, 4600, 4601, 4602, 4603, 4604]
+  "candidate_material_ids": [4777, 4675, 5205, 5218]
 }
 ```
 
@@ -91,7 +91,7 @@ PHP 侧只需传入 `uid` 与公网可访问的 `audio_url`，ASR 识别由 Pyth
 |------|------|------|------|
 | `uid` | int | **是** | 业务用户 ID；未传候选列表时，Milvus 默认过滤 `uid == {uid}` |
 | `audio_url` | string | **是** | 公网可访问的音频 URL；服务端据此调用火山 ASR |
-| `candidate_material_ids` | int[] | 否 | 待选素材 ID 列表；非空时仅在列表内检索，每段 `material_id` 不重复，且候选数 ≥ 片段数 |
+| `candidate_material_ids` | int[] | 否 | 待选素材 ID 列表；非空时片段数 = 去重后候选数，音频均分，每段 `material_id` 不重复 |
 | `filter` | string | 否 | 自定义 Milvus 标量过滤；与候选列表同时传入时取交集 |
 
 **高级模式（联调/测试可选）：** 若 PHP 侧已持有 ASR 结果，也可直接传 `result.utterances`（需同时提供 `audio_info.duration` 或 `result.additions.duration`），此时可省略 `audio_url`。生产环境以 `uid` + `audio_url` 为准。
@@ -160,7 +160,6 @@ PHP 侧只需传入 `uid` 与公网可访问的 `audio_url`，ASR 识别由 Pyth
 | HTTP | 场景 | detail 示例 |
 |------|------|-------------|
 | 400 | 参数缺失、ASR 失败 | `audio_url or result.utterances is required` |
-| 400 | 候选池小于片段数 | `候选素材池过小: candidate_count=4, segment_count=12, 候选素材数量需不少于片段数` |
 | 400 | Milvus 无匹配 | `向量库无可用素材: filter=..., unmatched_segments=...` |
 | 422 | JSON 格式 / 类型校验失败 | Pydantic 校验错误详情 |
 
@@ -183,11 +182,17 @@ flowchart TD
     search --> out[segments JSON出参]
 ```
 
-### Step 1：固定 3 秒切轴（不可变）
+### Step 1：时间切轴
 
-- 以 0、3、6、9… 秒为边界生成时间窗
-- 段数 = `ceil(音频毫秒 / 3000)`
-- **时间轴不因语义调整而改变**，只调整各窗内的文本归属
+**无候选列表（默认）：** 固定 3 秒切轴，段数 = `ceil(音频毫秒 / 3000)`。
+
+**有候选列表：** 段数 = 去重后 `candidate_material_ids` 数量，音频时长均分：
+
+```
+window_ms[i] = duration_ms * (i+1) // N - duration_ms * i // N
+```
+
+- 时间轴边界由均分决定，语义借词只调整各窗内文本归属
 
 ### Step 2：词级分配
 
@@ -224,7 +229,7 @@ flowchart TD
 | 不设阈值 | 低分素材正常纳入，不做过滤 |
 | **强制有素材** | 每段必须返回 1 个 `material_id`，禁止 null |
 | 范围过滤（无候选） | 默认 `uid == {uid}` |
-| 范围过滤（有候选） | 仅 `material_id in [候选列表]`，不叠加 `uid`；候选数须 ≥ 片段数 |
+| 范围过滤（有候选） | 仅 `material_id in [候选列表]`，不叠加 `uid`；片段数 = 候选数 |
 | 候选无匹配 | 不降级到全库，返回 `向量库无可用素材` |
 
 ---
@@ -239,7 +244,7 @@ flowchart TD
 | 段数准确 | 47.352s → 16 段，公式 `ceil(ms/3000)` |
 | 素材覆盖 | N 段各 1 条 `material_id`，零空段、零黑屏 |
 | 素材去重 | 同一请求内各段 `material_id` 互不相同 |
-| 候选池校验 | 传 `candidate_material_ids` 时，候选数 < 片段数直接报错 |
+| 候选驱动分句 | 传 `candidate_material_ids` 时，片段数 = 候选数，音频时长均分 |
 | 语义质量 | 相比 PHP 纯硬切，分句更完整，向量匹配更准确 |
 | 低分处理 | 低相似度素材仍正常返回，由全局排序自然决定 Top1 |
 
@@ -266,12 +271,11 @@ flowchart TD
 
 ```
 1. 上传/获取口播音频，得到公网可访问的 audio_url
-2. （可选）准备候选素材 ID 列表，确保去重后数量 ≥ 预估片段数
-     片段数 ≈ ceil(音频秒数 / 3)
+2. （可选）准备候选素材 ID 列表；传入后片段数 = 候选数，音频均分
 3. POST /material/match-segments
      { uid, audio_url }
    或 { uid, audio_url, candidate_material_ids: [...] }
-4. Python 服务端内部：火山 ASR → 3 秒分句 → 向量匹配（每段 material_id 不重复）
+4. Python 服务端内部：火山 ASR → 分句（无候选 3 秒 / 有候选均分）→ 向量匹配（每段 material_id 不重复）
 5. 遍历 response.segments：
      - 字幕文案：segments[i].text（或 raw_text）
      - 时间区间：start_sec ~ end_sec（各 3 秒）

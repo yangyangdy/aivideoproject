@@ -69,14 +69,22 @@ class MatchOrchestrator:
             max_len=500_000,
         )
 
-        segments = self._segmenter.segment(parsed.words, parsed.duration_ms)
+        candidate_ids = sorted({int(material_id) for material_id in (payload.get("candidate_material_ids") or [])})
+        segment_count = len(candidate_ids) if candidate_ids else None
+        if segment_count:
+            logger.info(
+                "match_segments candidate-driven segmentation segment_count=%s duration_ms=%s",
+                segment_count,
+                parsed.duration_ms,
+            )
+
+        segments = self._segmenter.segment(
+            parsed.words,
+            parsed.duration_ms,
+            segment_count=segment_count,
+        )
         if not segments:
             raise ValueError("no segments generated from ASR payload")
-
-        _validate_candidate_pool_size(
-            payload.get("candidate_material_ids") or [],
-            segment_count=len(segments),
-        )
 
         # 接口 text=逐词硬切；向量检索=语义补全后的 query_text。
         query_texts = [segment.query_text or segment.text or " " for segment in segments]
@@ -132,6 +140,9 @@ class MatchOrchestrator:
                     "similarity_score": round(hit.score, 4),
                 }
             )
+
+        if matched_segments:
+            segment_duration_sec = matched_segments[0]["end_sec"] - matched_segments[0]["start_sec"]
 
         logger.info(
             "match_segments finished total=%s first_material_id=%s first_score=%s",
@@ -238,22 +249,6 @@ class MatchOrchestrator:
                 len(used_material_ids),
             )
         return hits
-
-
-def _validate_candidate_pool_size(
-    candidate_material_ids: list[int] | list[object],
-    *,
-    segment_count: int,
-) -> None:
-    unique_count = len({int(material_id) for material_id in candidate_material_ids})
-    if unique_count == 0:
-        return
-    if unique_count < segment_count:
-        raise ValueError(
-            "候选素材池过小: "
-            f"candidate_count={unique_count}, segment_count={segment_count}, "
-            "候选素材数量需不少于片段数"
-        )
 
 
 def _append_excluded_material_ids(filter_expr: str, excluded_material_ids: list[int]) -> str:

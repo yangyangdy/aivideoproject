@@ -41,17 +41,7 @@ def match_segments(
     raw_result = orchestrator.match_segments(payload)
     _validate_segment_payload(raw_result.get("segments") or [])
 
-    response = MatchSegmentsResponse.model_validate(raw_result)
-    if response.segments:
-        first = response.segments[0]
-        logger.info(
-            "match_segments route response verified api_version=%s segment0 raw_text_len=%s query_text_len=%s text_eq_raw=%s",
-            MATCH_API_VERSION,
-            len(first.raw_text),
-            len(first.query_text),
-            first.text == first.raw_text,
-        )
-    return response
+    return MatchSegmentsResponse.model_validate(raw_result)
 
 
 def _validate_segment_payload(segments: list[object]) -> None:

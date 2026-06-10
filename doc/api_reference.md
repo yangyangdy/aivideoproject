@@ -651,7 +651,6 @@ GET  /material/info            →  查看 api_version 与分段字段定义
 | search 结果为空 | filter 过严或集合无数据 | 放宽 filter 或先 query 确认数据量 |
 | search/hybrid-search 500 | `EMBEDDING_API_KEY` 未配置或火山 API 失败 | 检查 Embedding 环境变量与网络 |
 | 误传 `data` 向量字段 | 旧版接口已废弃 | 改用 `input` 传文本/图片 |
-| match-segments 400 候选素材池过小 | `candidate_material_ids` 去重后数量 < 片段数 | 扩大候选列表，或缩短音频 |
 | match-segments 400 向量库无可用素材 | 候选池内无向量数据，或已全部分配 | 确认 Milvus 已灌库且候选 ID 正确 |
 | match-segments 重复 material_id | 旧版本行为 | 升级至当前版本，每段自动去重 |
 
@@ -669,7 +668,7 @@ GET  /material/info            →  查看 api_version 与分段字段定义
 |------|------|------|------|
 | uid | int | 是 | 业务用户 ID；未传候选列表时，Milvus 默认过滤 `uid == {uid}` |
 | audio_url | string | 是（推荐） | 公网可访问的音频 URL；服务端据此调用火山 ASR |
-| candidate_material_ids | int[] | 否 | 待选素材 ID 列表；非空时仅在列表内检索，且每段 `material_id` 不重复 |
+| candidate_material_ids | int[] | 否 | 待选素材 ID 列表；非空时片段数 = 去重后候选数，音频均分，每段 `material_id` 不重复 |
 | filter | string | 否 | 自定义 Milvus 标量过滤；与候选列表同时传入时取交集 |
 | audio_info.duration | int | 条件必填 | 音频总时长（毫秒）；**高级模式**传 ASR 结果时必填 |
 | result.additions.duration | string/int | 条件必填 | 同上 |
@@ -688,21 +687,23 @@ GET  /material/info            →  查看 api_version 与分段字段定义
 
 #### 带候选素材列表的请求示例
 
-PHP 侧已有一批待选素材时，传入 `candidate_material_ids`。服务端以候选列表为检索范围（不再叠加 `uid` 过滤），按片段顺序依次为每段分配**相似度最高且未使用过的**素材。
+PHP 侧已有一批待选素材时，传入 `candidate_material_ids`。服务端会：
 
-**注意：** 去重后的候选数量必须 **≥** 片段数（`total_segments`），否则直接返回 400。
+1. 以**去重后的候选数量**作为片段数（`total_segments`）
+2. 将音频时长**均分**为对应数量的时间窗（不再固定 3 秒）
+3. 在候选列表内按片段顺序分配**相似度最高且未使用过的**素材
+
+例如 33.167s 音频 + 4 个候选 → 4 段，每段约 8.29s（`segment_duration_sec` 为 8）。
 
 ```json
 {
   "uid": 13,
   "audio_url": "https://tulingai-1318672529.oss-cn-hangzhou.aliyuncs.com/uploads/voice/20260423/volcano_volcano_69e9d2575f2fb_3787_1776931442.mp3",
-  "candidate_material_ids": [4777, 4675, 5205, 5218, 4502, 4495, 3825, 4600, 4601, 4602, 4603, 4604]
+  "candidate_material_ids": [4777, 4675, 5205, 5218]
 }
 ```
 
-等价 Milvus 过滤表达式（第 0 段）：`material_id in [3825, 4495, 4502, 4600, 4601, 4602, 4603, 4604, 4675, 4777, 5205, 5218]`。
-
-后续片段会在上述条件上追加 `material_id not in [已分配ID]`，确保不重复。
+等价 Milvus 过滤表达式（第 0 段）：`material_id in [4675, 4777, 5205, 5218]`。
 
 若同时传入 `filter`，则与候选列表取交集，例如 `filter` 为 `tenant_id == 9` 时：
 
@@ -748,8 +749,8 @@ PHP 侧已有一批待选素材时，传入 `candidate_material_ids`。服务端
 |------|------|------|
 | api_version | string | 固定 `v2-dual-text` |
 | audio_duration_ms | int | 音频时长（毫秒） |
-| segment_duration_sec | int | 固定 3 |
-| total_segments | int | `ceil(duration_ms / 3000)` |
+| segment_duration_sec | int | 未传候选时为 **3**；传候选时为均分后的单段时长（秒，向下取整） |
+| total_segments | int | 未传候选：`ceil(duration_ms / 3000)`；传候选：去重后 `candidate_material_ids` 数量 |
 | segments | array | 分段列表 |
 | segments[].index | int | 段序号，从 0 起 |
 | segments[].start_sec | int | 起始秒（0, 3, 6, …） |
@@ -795,15 +796,17 @@ PHP 侧已有一批待选素材时，传入 `candidate_material_ids`。服务端
 
 ### 7.3 业务约束
 
-- 每段 `end_sec - start_sec` 恒为 3 秒
-- 每段强制返回 1 条 `material_id`，不设相似度阈值过滤
-- **每段 `material_id` 全局不重复**：已分配的素材在后续片段中自动排除，取下一名最高分
-- 不返回 `material_path`，由 PHP 按 `material_id` 查询
-- 未传 `candidate_material_ids` 时，在 `uid == {uid}`（或自定义 `filter`）范围内按上述去重规则匹配
+- 未传 `candidate_material_ids` 时：每段固定 3 秒（`end_sec - start_sec == 3`）
 - 传入 `candidate_material_ids` 时：
+  - 片段数 = 去重后候选数量，音频时长均分
+  - `segment_duration_sec` 反映均分后的单段时长（各段毫秒边界取整后秒数可能差 1）
+- 每段强制返回 1 条 `material_id`，不设相似度阈值过滤
+- **每段 `material_id` 全局不重复**
+- 不返回 `material_path`，由 PHP 按 `material_id` 查询
+- 未传候选时，在 `uid == {uid}`（或自定义 `filter`）范围内按上述去重规则匹配
+- 传入候选时：
   - 仅在候选列表内检索，不降级到全库
-  - 不再叠加 `uid` 过滤（候选列表即范围）
-  - 去重后的候选数 **≥** `total_segments`，否则返回 `候选素材池过小`
+  - 不再叠加 `uid` 过滤
   - 候选池内无可用素材时返回 `向量库无可用素材`
 
 ### 7.4 错误响应
@@ -811,7 +814,6 @@ PHP 侧已有一批待选素材时，传入 `candidate_material_ids`。服务端
 | HTTP | 场景 | detail 示例 |
 |------|------|-------------|
 | 400 | 参数缺失、ASR 失败 | `audio_url or result.utterances is required` |
-| 400 | 候选池小于片段数 | `候选素材池过小: candidate_count=4, segment_count=12, 候选素材数量需不少于片段数` |
 | 400 | Milvus 无匹配 | `向量库无可用素材: filter=..., unmatched_segments=...` |
 | 422 | JSON 格式 / 类型校验失败 | Pydantic 校验错误详情 |
 
@@ -826,13 +828,13 @@ curl -X POST "http://127.0.0.1:8000/material/match-segments" \
     "audio_url": "https://tulingai-1318672529.oss-cn-hangzhou.aliyuncs.com/uploads/voice/20260423/volcano_volcano_69e9d2575f2fb_3787_1776931442.mp3"
   }'
 
-# 限定候选素材列表（候选数须 ≥ 片段数）
+# 限定候选素材列表（片段数 = 候选数，时长均分）
 curl -X POST "http://127.0.0.1:8000/material/match-segments" \
   -H "Content-Type: application/json" \
   -d '{
     "uid": 13,
     "audio_url": "https://tulingai-1318672529.oss-cn-hangzhou.aliyuncs.com/uploads/voice/20260423/volcano_volcano_69e9d2575f2fb_3787_1776931442.mp3",
-    "candidate_material_ids": [4777, 4675, 5205, 5218, 4502, 4495, 3825, 4600, 4601, 4602, 4603, 4604]
+    "candidate_material_ids": [4777, 4675, 5205, 5218]
   }'
 
 # 高级模式：直接传 ASR 结果（单测 / 联调）
